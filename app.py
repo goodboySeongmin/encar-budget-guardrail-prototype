@@ -14,7 +14,6 @@ from dotenv import load_dotenv  # ✅ dotenv 사용
 # ==============================
 st.set_page_config(
     page_title="Encar Budget Guardrail – Internal PoC",
-    page_icon="🚗",
     layout="wide",
 )
 
