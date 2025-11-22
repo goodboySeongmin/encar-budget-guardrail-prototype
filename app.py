@@ -1,713 +1,489 @@
+import math
 import os
-import json
 from dataclasses import dataclass
-from pathlib import Path
-from typing import List, Literal, Optional
+from typing import List
 
 import pandas as pd
 import streamlit as st
-from dotenv import load_dotenv
 from openai import OpenAI
+from dotenv import load_dotenv  # ✅ dotenv 사용
+
 
 # ==============================
-# 0. .env 로드 & API Key 준비
+# 0. 기본 설정 & OpenAI 키 로딩
 # ==============================
+st.set_page_config(
+    page_title="Encar Budget Guardrail – Internal PoC",
+    page_icon="🚗",
+    layout="wide",
+)
 
-BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(dotenv_path=BASE_DIR / ".env")
+# 로컬(.env) → 클라우드(secrets) 순서로 키 찾기
+load_dotenv()  # .env 로드
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    try:
+        api_key = st.secrets["OPENAI_API_KEY"]
+    except Exception:
+        api_key = None
+
+if not api_key:
+    st.error(
+        "OPENAI_API_KEY가 설정되어 있지 않습니다.\n"
+        ".env 파일 또는 Streamlit Secrets에 키를 추가한 뒤 다시 실행해주세요."
+    )
+    st.stop()
+
+client = OpenAI(api_key=api_key)
+
+# 커스텀 스타일 (카드 / 등급 뱃지 등)
+st.markdown(
+    """
+    <style>
+    .pill {
+        display: inline-block;
+        padding: 0.35rem 1.2rem;
+        border-radius: 999px;
+        font-weight: 600;
+        font-size: 0.95rem;
+        border: 1px solid rgba(0,0,0,0.08);
+        margin-right: 0.3rem;
+        margin-bottom: 0.3rem;
+    }
+    .pill-A { background-color: #e8f8ec; color: #10793f; border-color: #6fd39b; }
+    .pill-B { background-color: #fff7e6; color: #b26b00; border-color: #ffd27f; }
+    .pill-C { background-color: #ffecec; color: #c2352b; border-color: #ff9b9b; }
+
+    .card {
+        border-radius: 12px;
+        padding: 1.0rem 1.2rem;
+        border: 1px solid rgba(0,0,0,0.06);
+        margin-bottom: 0.75rem;
+        background-color: #ffffff;
+    }
+    .card-soft {
+        background-color: #f7f9fc;
+    }
+    .card-danger {
+        background-color: #fff5f5;
+    }
+    .card-safe {
+        background-color: #f2fbf5;
+    }
+    .card-info {
+        background-color: #f2f4ff;
+    }
+    .section-title {
+        font-weight: 800;
+        font-size: 1.25rem;
+        margin-bottom: 0.6rem;
+        margin-top: 1.2rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 # ==============================
-# 1. 차량 데이터 정의 (관심 차량 3대 예시)
+# 1. 데이터 모델 & 유틸 함수
 # ==============================
-
-RiskLevel = Literal["낮음", "보통", "높음"]
-
-
 @dataclass
-class CarSpec:
-    """Mock 차량 스펙 데이터 (프로토타입용: 사용자가 찜/비교해 둔 후보 3대)"""
-    id: int
+class Car:
     name: str
-    segment: str          # 예: "소형 SUV", "중형 SUV"
-    price: int            # 차량 가격 (만원 단위, 예: 1800 = 1,800만원)
-    year: int             # 연식
-    mileage_km: int       # 주행거리 (km)
-    fuel_efficiency: float  # 연비 (km/L)
-    base_insurance_year: int  # 기준 연간 보험료 (원)
-    maintenance_risk: RiskLevel  # 정비 리스크 (낮음/보통/높음)
-    base_depr_3y: float   # 3년 감가율 (예: 0.30 = 30%)
+    year: int
+    segment: str
+    price: int  # 차량가(원)
+    fuel_eff_km_per_l: float
+    maintenance_risk: str  # "낮음" / "보통" / "높음"
 
 
-# 실제 서비스에선 사용자의 관심/비교 목록에서 가져온다고 가정하고,
-# 프로토타입에서는 3대를 예시로 고정한다.
-CAR_LIST: List[CarSpec] = [
-    CarSpec(
-        id=1,
-        name="2019 소형 SUV A",
-        segment="소형 SUV",
-        price=1800,
-        year=2019,
-        mileage_km=60000,
-        fuel_efficiency=12.0,
-        base_insurance_year=900000,
-        maintenance_risk="낮음",
-        base_depr_3y=0.30,
-    ),
-    CarSpec(
-        id=2,
-        name="2018 소형 SUV B",
-        segment="소형 SUV",
-        price=1600,
-        year=2018,
-        mileage_km=80000,
-        fuel_efficiency=11.0,
-        base_insurance_year=950000,
-        maintenance_risk="보통",
-        base_depr_3y=0.35,
-    ),
-    CarSpec(
-        id=3,
-        name="2017 중형 SUV C",
-        segment="중형 SUV",
-        price=2200,
-        year=2017,
-        mileage_km=90000,
-        fuel_efficiency=9.0,
-        base_insurance_year=1100000,
-        maintenance_risk="높음",
-        base_depr_3y=0.45,
-    ),
-]
-
-# ==============================
-# 2. 재무/리스크 계산 함수
-# ==============================
+def get_demo_cars() -> List[Car]:
+    """
+    데모용 차량 3대.
+    실제 엔카 연동 시에는 API 결과를 여기에 매핑하면 됨.
+    """
+    return [
+        Car(
+            name="2018 소형 SUV A*",
+            year=2018,
+            segment="소형 SUV",
+            price=18000000,
+            fuel_eff_km_per_l=12.0,
+            maintenance_risk="낮음",
+        ),
+        Car(
+            name="2019 소형 SUV B**",
+            year=2019,
+            segment="소형 SUV",
+            price=21000000,
+            fuel_eff_km_per_l=11.0,
+            maintenance_risk="보통",
+        ),
+        Car(
+            name="2017 중형 SUV C**",
+            year=2017,
+            segment="중형 SUV",
+            price=24000000,
+            fuel_eff_km_per_l=9.5,
+            maintenance_risk="높음",
+        ),
+    ]
 
 
-def calc_monthly_payment(price_krw: int, months: int = 36, annual_rate: float = 0.05) -> int:
-    """원리금 귕등 상환 기준 월 납입액"""
+def monthly_loan_payment(price: int, months: int, annual_rate: float = 0.06) -> float:
+    """원리금 균등상환 월 납입액 계산 (간단 버전)."""
     if months <= 0:
-        return price_krw
-
-    monthly_rate = annual_rate / 12.0
-    if monthly_rate == 0:
-        return price_krw // months
-
-    numerator = monthly_rate * (1 + monthly_rate) ** months
-    denominator = (1 + monthly_rate) ** months - 1
-    monthly_payment = price_krw * numerator / denominator
-    return int(monthly_payment)
+        return float(price)
+    r = annual_rate / 12.0
+    if r == 0:
+        return price / months
+    n = months
+    return price * (r * (1 + r) ** n) / ((1 + r) ** n - 1)
 
 
-def calc_monthly_fuel_cost(
-    monthly_mileage_km: int,
-    fuel_efficiency_km_per_l: float,
-    fuel_price_per_l: int = 1800,
-) -> int:
-    if fuel_efficiency_km_per_l <= 0:
-        return 0
-    liters = monthly_mileage_km / fuel_efficiency_km_per_l
-    return int(liters * fuel_price_per_l)
-
-
-def calc_monthly_insurance_cost(base_insurance_year: int) -> int:
-    return int(base_insurance_year / 12)
-
-
-def calc_monthly_parking_toll_cost(has_paid_parking: bool) -> int:
-    return 50000 if has_paid_parking else 0
-
-
-def maintenance_risk_to_cost(risk: RiskLevel) -> int:
+def estimate_maintenance_cost(risk: str, years: int = 3) -> int:
+    """정비 리스크에 따른 3년 정비비 대략치 (단순 가정)."""
+    base = 800000  # 3년간 최소 정비비
     if risk == "낮음":
-        return 600000
+        return base
     elif risk == "보통":
-        return 1200000
-    else:
-        return 2000000
+        return int(base * 1.4)
+    else:  # 높음
+        return int(base * 2.0)
 
 
-def calc_depreciation(price_krw: int, base_depr_3y: float):
-    depr_amount = int(price_krw * base_depr_3y)
-    depr_rate = base_depr_3y
-    return depr_amount, depr_rate
+def estimate_depreciation(price: int, years: int = 3) -> int:
+    """3년간 감가액 (단순 가정)."""
+    rate = 0.35  # 3년간 35% 감가
+    return int(price * rate)
 
 
-def calc_safety_grade(
-    monthly_vehicle_cost: int,
-    monthly_income: int,
-    depr_rate_3y: float,
-    maintenance_risk: RiskLevel,
-) -> str:
-    """재무 안전도 등급 (A/B/C)"""
-    if monthly_income <= 0:
-        return "C"
+def assign_grade(monthly_cost: float, income: float, risk: str) -> str:
+    """월 지출/소득 비율과 정비 리스크를 기준으로 A/B/C 등급 부여."""
+    ratio = monthly_cost / income if income > 0 else 1.0
+    risk_weight = {"낮음": 0, "보통": 1, "높음": 2}.get(risk, 1)
 
-    ratio = monthly_vehicle_cost / monthly_income
-
-    if maintenance_risk == "낮음":
-        risk_score = 1
-    elif maintenance_risk == "보통":
-        risk_score = 2
-    else:
-        return "C"  # 리스크 "높음"이면 무조건 C
-
-    if ratio <= 0.15 and depr_rate_3y <= 0.35 and risk_score <= 2:
+    if ratio <= 0.15 and risk_weight <= 1:
         return "A"
-    elif ratio <= 0.20 and depr_rate_3y <= 0.45:
+    elif ratio <= 0.2:
         return "B"
     else:
         return "C"
 
 
-# ==============================
-# 3. LLM 프롬프트 & 호출 (사용자 관점 JSON + 예산 가드레일)
-# ==============================
-
-def build_llm_prompt(
-    monthly_income: int,
-    monthly_fixed_expense: int,
-    num_children: int,
-    monthly_mileage: int,
-    ownership_years: int,
-    user_monthly_budget: Optional[int],
-    df: pd.DataFrame,
-) -> str:
-    # 사용자 상황 JSON
-    user_context = {
-        "monthly_income": monthly_income,
-        "monthly_fixed_expense": monthly_fixed_expense,
-        "num_children": num_children,
-        "monthly_mileage": monthly_mileage,
-        "ownership_years": ownership_years,
-        # 사용자가 스스로 정한 월 차량 예산(상한). 없으면 null.
-        "user_monthly_vehicle_budget": user_monthly_budget,
-    }
-
-    # 차량별 핵심 지표 JSON
-    cars = []
-    for _, row in df.iterrows():
-        cars.append(
-            {
-                "name": row["차량명"],
-                "segment": row["차급"],
-                "safety_grade": row["재무 안전도"],
-                "monthly_cost": int(row["월 차량 지출(원)"]),
-                "ratio_str": row["월 소득 대비 비율"],
-                "tco_3y": int(row["3년 TCO(원)"]),
-                "budget_diff": int(row["예산 대비 차이(원)"]) if "예산 대비 차이(원)" in row else None,
-            }
-        )
-
-    prompt = f"""
-당신은 한국의 중고차 재무·리스크 코치입니다.
-
-이 서비스는 기본적으로
-- 30대 중반 직장인 A
-- 자녀 2명
-- 패밀리카를 고민하는 가장
-이라는 페르소나를 대상으로 설계되었습니다.
-
-설명에서는 이 사용자를 항상
-"자녀 둘을 둔 30대 직장인 A" 페르소나로 언급해 주세요.
-단, 월 소득/지출/비율 등 구체 숫자는 아래 JSON의 실제 값을 사용해야 합니다.
-
-[사용자 상황 JSON]
-{json.dumps(user_context, ensure_ascii=False)}
-
-[후보 차량들 JSON]
-{json.dumps(cars, ensure_ascii=False)}
-
-위 정보를 바탕으로, 다음과 같은 JSON만 반환하세요. 다른 설명/텍스트/마크다운은 절대 포함하지 마세요.
-
-반환 JSON 스키마:
-{{
-  "user_summary": "페르소나 A(자녀 둘 30대 직장인)의 재무 상태와 차량 여력을 3~4문장으로 설명한 한국어 문장. 월 소득, 고정 지출, 차량에 쓸 수 있는 적정 비율(예: 10~15%), 자녀 둘이라는 가족 상황을 모두 언급해야 합니다.",
-  "grade_overview": "A/B/C 등급이 페르소나 A에게 각각 어떤 의미인지 3~4문장으로 설명한 문장. A 등급은 여유, B는 타협 가능한 선택, C는 위험 신호라는 식으로, 각 등급별 추천 월 지출 비율 범위를 함께 제시하세요.",
-  "recommended": [
-    {{
-      "name": "추천 차량명",
-      "reason": "이 차량이 페르소나 A에게 왜 상대적으로 안전한 선택인지 2~3문장으로 설명. 월 지출 비율, 3년 TCO, 재무 안전도 등급 같은 수치를 최소 1개 이상 포함하고, 주말 나들이/아이 통학/비상자금 등 생활 맥락도 함께 언급하세요."
-    }}
-  ],
-  "avoid": {{
-    "name": "피하거나 주의할 차량명 (없으면 null)",
-    "reason": "왜 피하는 것이 좋은지 2~3문장으로 설명. C 등급, 월 지출 비율이 높음, 3년 TCO가 과도함, 예기치 못한 수리비 등 수치와 스토리를 함께 언급하세요."
-  }},
-  "advice": "페르소나 A가 패밀리카를 살 때 꼭 기억해야 할 한 문장 조언. 월 소득 대비 몇 %를 차량에 쓰는 것이 건강한지, 그리고 스스로 정한 월 차량 예산을 가드레일로 삼아야 한다는 메시지를 함께 담으세요."
-}}
-
-추가 규칙:
-- recommended 배열에는 최대 2대까지만 넣으세요.
-- 재무 안전도 A/B 등급 중에서 우선 추천하고, C 등급은 추천하지 마세요.
-- avoid.name 은 재무 안전도 C 등급 중에서 가장 위험한 차량 1대를 고르거나, 없으면 null 로 설정하세요.
-- user_monthly_vehicle_budget 값이 null 이 아니면,
-  - user_summary 와 grade_overview, recommended.reason, avoid.reason, advice 에서
-    "사용자가 스스로 정한 월 차량 예산"과 후보 차량들의 실제 월 지출의 차이를 반드시 언급하세요.
-  - 예: "당초 스스로 정한 예산선보다 매달 8만~10만 원을 더 쓰는 조합"과 같은 표현.
-- user_summary, grade_overview, recommended.reason, avoid.reason 에는 반드시
-  - (1) 하나 이상의 구체 숫자 (월 지출 %, 3년 TCO, 소득, 예산 차이 등)
-  - (2) 페르소나 A의 가족/생활 맥락
-  이 두 가지가 모두 등장해야 합니다.
-- advice 는 반드시 1문장으로 작성하세요.
-- 반드시 위 스키마에 맞는 **유효한 JSON만** 출력하세요. JSON 밖에 다른 텍스트를 넣지 마세요.
-"""
-    return prompt.strip()
-
-
-def call_llm(prompt: str) -> dict:
-    if not OPENAI_API_KEY:
-        raise ValueError("OPENAI_API_KEY 환경변수가 설정되어 있지 않습니다. (.env 파일을 확인해 주세요)")
-
-    client = OpenAI(api_key=OPENAI_API_KEY)
-
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "당신은 한국의 중고차 재무 코치입니다. "
-                    "페르소나 A(자녀 둘 30대 직장인)의 관점에서, "
-                    "수치와 스토리를 함께 사용해 과도한 소비를 막으면서도 현실적인 패밀리카 선택을 돕습니다. "
-                    "사용자가 스스로 정한 월 차량 예산이 있다면 그 예산을 가드레일로 삼아, "
-                    "후보 차량들이 그 선을 얼마나 넘거나 지키고 있는지 명확하게 설명해야 합니다. "
-                    "JSON 형식 요구사항을 엄격히 지키세요."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.25,
-    )
-
-    raw = response.choices[0].message.content
-    try:
-        data = json.loads(raw)
-        return data
-    except Exception:
-        return {"_raw": raw}
+def format_won(x: float) -> str:
+    """천 단위 반올림해서 '1,234,000원' 형태로 표시."""
+    return f"{int(round(x, -3)):,}원"
 
 
 # ==============================
-# 4. UI 헬퍼 (색깔 카드/칩)
+# 2. 사이드바 – 사용자 입력
 # ==============================
+with st.sidebar:
+    st.title("1) 내 상황 입력하기")
+    st.caption("실제와 비슷하게 입력할수록 결과가 현실적이에요.")
 
-def colored_box(title: str, body: str, bg: str, border: str):
-    st.markdown(
-        f"""
-        <div style="
-            background-color:{bg};
-            border:1px solid {border};
-            padding:0.8rem 1rem;
-            border-radius:0.6rem;
-            font-size:0.9rem;
-            margin-bottom:0.7rem;
-        ">
-            <div style="font-weight:600;margin-bottom:0.25rem;">{title}</div>
-            <div>{body}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    income = st.number_input("세후 월 소득", min_value=0, step=100000, value=3000000)
+    fixed_cost = st.number_input(
+        "월 고정 지출(주거비·통신비·기타 대출 등)",
+        min_value=0,
+        step=100000,
+        value=1000000,
+    )
+    children = st.number_input("자녀 수", min_value=0, max_value=5, step=1, value=2)
+    monthly_km = st.number_input("예상 월 주행거리(km)", min_value=0, step=100, value=800)
+    fuel_price = st.number_input(
+        "리터당 유류비(원)", min_value=1000, max_value=3000, step=50, value=1700
+    )
+    has_paid_parking = st.checkbox("유료 주차/통행료가 자주 발생한다", value=True)
+    loan_months = st.number_input(
+        "할부 개월 수", min_value=0, max_value=84, step=6, value=36
+    )
+    budget = st.number_input(
+        "내가 생각하는 월 차량 예산 상한(원)", min_value=0, step=50000, value=600000
     )
 
+    st.markdown("---")
+    st.caption("※ 모든 수치는 단순 예시이며 실제 금융/세무 자문이 아닙니다.")
 
-def grade_chip(label: str, count: int, items: List[str], bg: str, border: str, text_color: str):
-    """등급 요약 칩: 등급/개수 + 해당 차량 이름들까지 표시"""
-    if items:
-        cars_text = ", ".join(items)
-    else:
-        cars_text = "해당 차량 없음"
-
-    st.markdown(
-        f"""
-        <div style="
-            background-color:{bg};
-            border:1px solid {border};
-            color:{text_color};
-            padding:0.7rem 1rem;
-            border-radius:999px;
-            font-size:0.85rem;
-            text-align:center;
-        ">
-            <div style="font-weight:700;">{label}</div>
-            <div style="margin-top:0.1rem;">{count}대</div>
-            <div style="font-size:0.75rem;margin-top:0.25rem;white-space:normal;">
-                <span style="opacity:0.8;">차량: {cars_text}</span>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def grade_style(grade: str):
-    """재무 안전도 등급별 색상 스타일"""
-    if grade == "A":
-        return "#ecfdf3", "#22c55e", "#166534"  # bg, border, text
-    elif grade == "B":
-        return "#fffbeb", "#facc15", "#854d0e"
-    else:
-        return "#fef2f2", "#f97373", "#991b1b"
-
-
-def format_budget_diff(diff: Optional[int]) -> str:
-    if diff is None:
-        return ""
-    if diff == 0:
-        return "내가 정한 예산과 거의 동일한 수준"
-    if diff < 0:
-        return f"내가 정한 예산보다 **{-diff:,}원 여유**"
-    return f"내가 정한 예산보다 **{diff:,}원 초과**"
-
-
-def car_card(row: pd.Series, user_monthly_budget: Optional[int]):
-    """개별 차량을 고객용 카드로 표현 (예산 대비 차이 포함)"""
-    bg, border, text = grade_style(row["재무 안전도"])
-    diff = None
-    if user_monthly_budget is not None:
-        diff = int(row["월 차량 지출(원)"]) - user_monthly_budget
-    budget_line = format_budget_diff(diff) if user_monthly_budget is not None else ""
-
-    st.markdown(
-        f"""
-        <div style="
-            background-color:{bg};
-            border:1px solid {border};
-            color:{text};
-            padding:0.9rem 1rem;
-            border-radius:0.8rem;
-            margin-bottom:0.8rem;
-            font-size:0.9rem;
-        ">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.4rem;">
-                <div style="font-weight:700;font-size:1rem;">{row["차량명"]}</div>
-                <div style="font-weight:700;">재무 안전도 {row["재무 안전도"]}</div>
-            </div>
-            <div style="display:flex;gap:1.5rem;flex-wrap:wrap;margin-bottom:0.3rem;">
-                <div>월 부담: <b>{row["월 차량 지출(원)"]:,}원</b></div>
-                <div>소득 대비: <b>{row["월 소득 대비 비율"]}</b></div>
-                <div>3년 총비용(TCO): <b>{row["3년 TCO(원)"]:,}원</b></div>
-            </div>
-            <div style="font-size:0.8rem;opacity:0.85;margin-bottom:0.2rem;">
-                차급: {row["차급"]} · 차량가: {row["가격(만원)"]:,}만원 · 3년 감가율: {row["3년 감가율"]}
-            </div>
-            {f'<div style="font-size:0.8rem;margin-top:0.15rem;">{budget_line}</div>' if budget_line else ''}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+disposable_income = max(income - fixed_cost, 0)
 
 
 # ==============================
-# 5. Streamlit UI (고객용 화면, 예산 가드레일 포함)
+# 3. 메인 – 헤더 및 차량 데이터 계산
 # ==============================
+st.title("예산 가드레일 코파일럿 ")
+st.write(
+    "엔카에서 찜해 둔 후보 차량들이 **내 월급·지출·가족 상황** 기준으로 "
+    "얼마나 안전한 선택인지 A/B/C 등급과 함께 보여주는 내부 PoC입니다."
+)
 
-def main():
-    st.set_page_config(
-        page_title="내 월급과 예산으로, 이 차 괜찮을까? (Prototype)",
-        layout="wide",
+cars = get_demo_cars()
+rows = []
+
+for car in cars:
+    loan = monthly_loan_payment(car.price, loan_months) if loan_months > 0 else car.price
+    fuel_cost = (
+        (monthly_km / car.fuel_eff_km_per_l) * fuel_price
+        if car.fuel_eff_km_per_l > 0
+        else 0
     )
+    parking_cost = 80000 if has_paid_parking else 20000
+    monthly_total = loan + fuel_cost + parking_cost
+    maint_3y = estimate_maintenance_cost(car.maintenance_risk, years=3)
+    dep_3y = estimate_depreciation(car.price, years=3)
+    tco_3y = monthly_total * 36 + maint_3y + dep_3y
+    ratio = monthly_total / income if income > 0 else 1.0
+    grade = assign_grade(monthly_total, income, car.maintenance_risk)
+    budget_diff = monthly_total - budget
 
-    st.title("내 월급과 예산으로, 이 차 괜찮을까? ")
-    st.caption(
-        "엔카에서 이미 골라 둔 후보 차량들을 가져와, "
-        "내 월 소득·고정 지출·자녀 수·주행거리·월 차량 예산을 기준으로 "
-        "월 부담, 3년 총비용, 재무 안전도 A/B/C를 비교해 주는 프로토타입입니다."
-    )
-
-    # ---- 좌측: 내 상황 & 예산 입력 ----
-    with st.sidebar:
-        st.header("1) 내 상황 입력하기")
-
-        monthly_income = st.number_input(
-            "세후 월 소득 (원)",
-            min_value=0,
-            value=3000000,
-            step=100000,
-            help="급여에서 실수령액 기준으로 입력해 주세요.",
-        )
-
-        monthly_fixed_expense = st.number_input(
-            "월 고정 지출 (주거비/통신비/대출 등, 원)",
-            min_value=0,
-            value=2000000,
-            step=100000,
-            help="매달 거의 변하지 않는 고정 비용을 합산해서 입력해 주세요.",
-        )
-
-        num_children = st.number_input(
-            "자녀 수",
-            min_value=0,
-            max_value=5,
-            value=2,
-            step=1,
-        )
-
-        monthly_mileage = st.number_input(
-            "예상 월 주행거리 (km)",
-            min_value=0,
-            value=800,
-            step=100,
-            help="출퇴근, 주말 나들이 등을 포함한 월 평균 주행거리를 입력해 주세요.",
-        )
-
-        ownership_years = st.selectbox(
-            "차를 몇 년 정도 탈 예정인가요?",
-            options=[3, 5],
-            index=0,
-            format_func=lambda y: f"{y}년 정도",
-        )
-
-        loan_months = st.slider(
-            "할부 기간 (개월)",
-            min_value=12,
-            max_value=72,
-            value=36,
-            step=12,
-            help="월 납입액 계산에 사용됩니다. 아래 3년 총비용은 비교 기준용입니다.",
-        )
-
-        has_paid_parking = st.checkbox(
-            "유료 주차비/통행료가 매달 발생해요",
-            value=True,
-        )
-
-        st.markdown("---")
-
-        user_monthly_budget: Optional[int] = None
-        use_budget = st.checkbox("나는 월 차량 예산(상한)을 정해두었어요", value=True)
-        if use_budget:
-            user_monthly_budget = st.number_input(
-                "월 차량 예산 상한 (원)",
-                min_value=50000,
-                value=400000,
-                step=50000,
-                help="할부 + 보험 + 기름 + 주차비 등을 모두 포함해서, "
-                     "차량에 최대 얼마까지 쓰겠다고 생각하는지 입력해 주세요.",
-            )
-
-        if monthly_income > 0:
-            free_cash = max(monthly_income - monthly_fixed_expense, 0)
-            safe_range_low = int(monthly_income * 0.10)
-            safe_range_high = int(monthly_income * 0.15)
-
-            st.markdown("#### 💡 재무 여력 가이드")
-            st.write(f"- 매달 남는 돈(대략): **{free_cash:,}원**")
-            st.write(
-                f"- 일반적으로 차량에 써도 괜찮은 권장 범위: "
-                f"**{safe_range_low:,} ~ {safe_range_high:,}원/월** (월 소득의 10~15%)"
-            )
-            if user_monthly_budget:
-                st.write(
-                    f"- 내가 정한 월 차량 예산: **{user_monthly_budget:,}원/월** "
-                    f"(권장 범위와 얼마나 차이가 나는지도 함께 참고해 보세요.)"
-                )
-        else:
-            st.info("월 소득을 입력하면, 차량에 써도 괜찮은 권장 범위를 보여드립니다.")
-
-        if not OPENAI_API_KEY:
-            st.error("⚠️ .env 파일의 OPENAI_API_KEY가 설정되지 않아 AI 설명 기능을 사용할 수 없습니다.")
-
-    # ---- 중앙: 차량별 지표 계산 ----
-    st.header("2) 내가 골라 둔 후보 차량들, 숫자로 비교해 보기")
-
-    rows = []
-    FUEL_PRICE_PER_L = 1800
-    LOAN_RATE = 0.05  # 연 이자율 (5%)
-
-    for car in CAR_LIST:
-        price_krw = car.price * 10000
-
-        monthly_payment = calc_monthly_payment(
-            price_krw=price_krw,
-            months=loan_months,
-            annual_rate=LOAN_RATE,
-        )
-        monthly_fuel = calc_monthly_fuel_cost(
-            monthly_mileage_km=monthly_mileage,
-            fuel_efficiency_km_per_l=car.fuel_efficiency,
-            fuel_price_per_l=FUEL_PRICE_PER_L,
-        )
-        monthly_insurance = calc_monthly_insurance_cost(car.base_insurance_year)
-        monthly_parking_toll = calc_monthly_parking_toll_cost(has_paid_parking)
-
-        monthly_vehicle_cost = monthly_payment + monthly_fuel + monthly_insurance + monthly_parking_toll
-        ratio = monthly_vehicle_cost / monthly_income if monthly_income > 0 else 0
-
-        depr_amount_3y, depr_rate_3y = calc_depreciation(
-            price_krw=price_krw,
-            base_depr_3y=car.base_depr_3y,
-        )
-        maintenance_cost_3y = maintenance_risk_to_cost(car.maintenance_risk)
-
-        # TCO는 3년 기준 (36개월분 지출)
-        tco_3y = monthly_vehicle_cost * 36 + maintenance_cost_3y + depr_amount_3y
-
-        safety_grade = calc_safety_grade(
-            monthly_vehicle_cost=monthly_vehicle_cost,
-            monthly_income=monthly_income,
-            depr_rate_3y=depr_rate_3y,
-            maintenance_risk=car.maintenance_risk,
-        )
-
-        budget_diff = None
-        if user_monthly_budget is not None:
-            budget_diff = monthly_vehicle_cost - user_monthly_budget
-
-        rows.append({
+    rows.append(
+        {
             "차량명": car.name,
+            "연식": car.year,
             "차급": car.segment,
-            "가격(만원)": car.price,
-            "월 차량 지출(원)": monthly_vehicle_cost,
-            "월 소득 대비 비율": f"{ratio * 100:.1f}%",
-            "3년 감가액(원)": depr_amount_3y,
-            "3년 감가율": f"{depr_rate_3y * 100:.0f}%",
-            "3년 정비비(원)": maintenance_cost_3y,
-            "3년 TCO(원)": tco_3y,
-            "재무 안전도": safety_grade,
-            "예산 대비 차이(원)": budget_diff if budget_diff is not None else 0,
-        })
+            "차량가": car.price,
+            "월 할부+운행비": monthly_total,
+            "월 소득 대비 비율": ratio,
+            "3년 TCO": tco_3y,
+            "정비 리스크": car.maintenance_risk,
+            "재무 안전도 등급": grade,
+            "예산 대비 차이": budget_diff,
+        }
+    )
 
-    df = pd.DataFrame(rows)
+df = pd.DataFrame(rows)
 
-    safety_order = {"A": 0, "B": 1, "C": 2}
-    df["_order"] = df["재무 안전도"].map(safety_order)
-    df = df.sort_values(by=["_order", "3년 TCO(원)"], ascending=[True, True]).drop(columns=["_order"])
+# 가이드라인 계산 (월 소득의 10~15%)
+guideline_low = income * 0.10
+guideline_high = income * 0.15
+min_monthly = df["월 할부+운행비"].min()
+max_monthly = df["월 할부+운행비"].max()
 
-    # ---- 고객용 카드 뷰 ----
-    st.markdown("#### ✅ 내 월급·예산 기준으로, 각 후보는 이렇게 보입니다.")
 
-    for _, row in df.iterrows():
-        car_card(row, user_monthly_budget)
+# ==============================
+# 4. 내 재무 스냅샷
+# ==============================
+st.markdown('<div class="section-title">2) 내 재무 스냅샷</div>', unsafe_allow_html=True)
 
-    # ---- 필요할 때만 숫자 표 열기 ----
-    with st.expander("📊 숫자 자세히 보기 (관심 있는 분용)"):
-        st.dataframe(df, use_container_width=True)
+col_left, col_right = st.columns(2)
 
-    # ---- 등급 요약 배지 ----
-    st.subheader("3) 등급별로 후보 정리해 보기")
+with col_left:
+    st.markdown(
+        f"""
+        <div class="card card-info">
+          <div style="font-weight:700; margin-bottom:0.4rem;">현재 가계 현황</div>
+          <div style="font-size:0.9rem;">
+            • 세후 월 소득: <b>{format_won(income)}</b><br>
+            • 월 고정 지출: <b>{format_won(fixed_cost)}</b><br>
+            • 월 가용 소득(여윳돈): <b>{format_won(disposable_income)}</b><br>
+            • 내가 정한 월 차량 예산 상한: <b>{format_won(budget)}</b>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    num_A = (df["재무 안전도"] == "A").sum()
-    num_B = (df["재무 안전도"] == "B").sum()
-    num_C = (df["재무 안전도"] == "C").sum()
+with col_right:
+    st.markdown(
+        f"""
+        <div class="card card-soft">
+          <div style="font-weight:700; margin-bottom:0.4rem;">차량 지출 가이드라인 vs 후보</div>
+          <div style="font-size:0.9rem; margin-bottom:0.3rem;">
+            • 일반적인 권장 차량 지출 가이드라인: <b>월 소득의 10~15%</b><br>
+            → 이 사용자 기준: <b>{format_won(guideline_low)} ~ {format_won(guideline_high)}</b>
+          </div>
+          <div style="font-size:0.9rem;">
+            • 현재 후보 차량 월 지출 범위: <b>{format_won(min_monthly)} ~ {format_won(max_monthly)}</b><br>
+            • 가장 부담 큰 차량을 선택하면, 월 소득의 약 <b>{df['월 소득 대비 비율'].max()*100:.1f}%</b>를 차량에 쓰게 됩니다.
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    items_A = df[df["재무 안전도"] == "A"]["차량명"].tolist()
-    items_B = df[df["재무 안전도"] == "B"]["차량명"].tolist()
-    items_C = df[df["재무 안전도"] == "C"]["차량명"].tolist()
 
-    col_a, col_b, col_c = st.columns(3)
-    with col_a:
-        grade_chip("A (예산 안의 안심 구간)", num_A, items_A, bg="#ecfdf3", border="#22c55e", text_color="#166534")
-    with col_b:
-        grade_chip("B (조금 타이트하지만 고려 가능)", num_B, items_B, bg="#fffbeb", border="#facc15", text_color="#854d0e")
-    with col_c:
-        grade_chip("C (예산/소득 대비 무리 가능성 높음)", num_C, items_C, bg="#fef2f2", border="#f97373", text_color="#991b1b")
+# ==============================
+# 5. 등급 요약 섹션
+# ==============================
+st.markdown('<div class="section-title">3) 재무 안전도 등급 요약</div>', unsafe_allow_html=True)
 
-    if num_C > 0:
-        st.warning(
-            "C 등급 차량은 지금 재무 상황에서 월 부담과 3년 총비용이 꽤 큰 편입니다. "
-            "가능하면 A/B 등급에서 먼저 후보를 골라보고, C 차량은 '감성 소비'인지 한 번 더 생각해 보세요."
+col_a, col_b, col_c = st.columns(3)
+
+for grade, col in zip(["A", "B", "C"], [col_a, col_b, col_c]):
+    subset = df[df["재무 안전도 등급"] == grade]
+    count = len(subset)
+    if grade == "A":
+        desc = "재무적인 여유가 있는 선택입니다."
+        css = "pill pill-A"
+    elif grade == "B":
+        desc = "관리 가능한 타협 구간입니다."
+        css = "pill pill-B"
+    else:
+        desc = "장기적으로 재무 부담 리스크가 있는 구간입니다."
+        css = "pill pill-C"
+
+    with col:
+        st.markdown(
+            f"""
+            <div class="card card-soft">
+              <div class="{css}" style="margin-bottom:0.5rem;">{grade} 등급 · {count}대</div>
+              <div style="font-size:0.9rem; margin-bottom:0.4rem;">{desc}</div>
+              <div style="font-size:0.85rem; color:#555;">
+            """,
+            unsafe_allow_html=True,
         )
+        if count == 0:
+            st.markdown("해당 등급 차량이 없습니다.", unsafe_allow_html=True)
+        else:
+            for name in subset["차량명"].tolist():
+                st.markdown(f"• {name}", unsafe_allow_html=True)
+        st.markdown("</div></div>", unsafe_allow_html=True)
 
-    # ---- AI 설명 (수치 + 스토리 요약) ----
-    st.subheader("4) AI가 내 예산과 후보들을 함께 정리해 드려요")
-
-    if st.button("AI에게 내 상황 정리받기"):
-        with st.spinner("AI가 월 소득·지출과 예산, 후보 차량들을 함께 보고 정리하는 중입니다..."):
-            try:
-                prompt = build_llm_prompt(
-                    monthly_income=monthly_income,
-                    monthly_fixed_expense=monthly_fixed_expense,
-                    num_children=num_children,
-                    monthly_mileage=monthly_mileage,
-                    ownership_years=ownership_years,
-                    user_monthly_budget=user_monthly_budget,
-                    df=df,
-                )
-                summary = call_llm(prompt=prompt)
-
-                if summary is None:
-                    st.error("AI 응답을 해석할 수 없습니다.")
-                elif "_raw" in summary:
-                    st.error("AI 응답이 JSON 형식이 아니었습니다. 원본 텍스트를 표시합니다.")
-                    st.markdown(summary["_raw"])
-                else:
-                    user_summary = summary.get("user_summary", "")
-                    grade_overview = summary.get("grade_overview", "")
-                    recommended = summary.get("recommended", [])
-                    avoid = summary.get("avoid", {})
-                    advice = summary.get("advice", "")
-
-                    # 1) 내 재무 & 예산 상황 요약
-                    colored_box(
-                        "내 재무 & 예산 상황 요약",
-                        user_summary,
-                        bg="#eff6ff",
-                        border="#3b82f6",
-                    )
-
-                    # 2) A/B/C 등급이 의미하는 것
-                    colored_box(
-                        "A/B/C 등급이 의미하는 것",
-                        grade_overview,
-                        bg="#fefce8",
-                        border="#facc15",
-                    )
-
-                    # 3) 내 상황에 더 안전한 선택
-                    if recommended:
-                        lines = []
-                        for r in recommended:
-                            name = r.get("name", "")
-                            reason = r.get("reason", "")
-                            lines.append(f"• **{name}** – {reason}")
-                        colored_box(
-                            "내 상황에 더 안전한 선택",
-                            "<br/>".join(lines),
-                            bg="#ecfdf3",
-                            border="#22c55e",
-                        )
-                    else:
-                        colored_box(
-                            "내 상황에 더 안전한 선택",
-                            "추천할 차량이 명확하지 않습니다.",
-                            bg="#f1f5f9",
-                            border="#cbd5f5",
-                        )
-
-                    # 4) 조금 더 조심해서 볼 차량
-                    avoid_name = avoid.get("name") if isinstance(avoid, dict) else None
-                    avoid_reason = avoid.get("reason", "") if isinstance(avoid, dict) else ""
-
-                    if avoid_name and avoid_name.lower() != "null":
-                        body = f"• **{avoid_name}** – {avoid_reason}"
-                        colored_box(
-                            "조금 더 조심해서 볼 차량",
-                            body,
-                            bg="#fef2f2",
-                            border="#f97373",
-                        )
-                    else:
-                        colored_box(
-                            "조금 더 조심해서 볼 차량",
-                            "특별히 하나를 집어 피해야 할 차량은 없습니다.",
-                            bg="#fdf2ff",
-                            border="#e879f9",
-                        )
-
-                    # 5) 한 문장 조언
-                    colored_box(
-                        "한 문장 조언",
-                        advice,
-                        bg="#f4f4f5",
-                        border="#d4d4d8",
-                    )
-
-            except Exception as e:
-                st.error(f"LLM 호출 중 오류가 발생했습니다: {e}")
+# C 등급 경고
+if (df["재무 안전도 등급"] == "C").any():
+    st.markdown(
+        """
+        <div class="card card-danger">
+        ⚠️ <b>C 등급 차량</b>은 월 소득 대비 지출 비율이 높거나 정비 리스크가 커서,
+        장기적으로 재무 부담 및 불만(환불·계약 변경) 가능성이 있는 구간입니다.
+        실제 상담 시 예산 재조정 또는 대안 제시가 권장됩니다.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
-if __name__ == "__main__":
-    main()
+# ==============================
+# 6. 차량별 상세 카드
+# ==============================
+st.markdown(
+    '<div class="section-title">4) 후보 차량별 재무 관점 상세</div>',
+    unsafe_allow_html=True,
+)
+
+for _, row in df.iterrows():
+    grade = row["재무 안전도 등급"]
+    if grade == "A":
+        css = "card card-safe"
+    elif grade == "B":
+        css = "card card-soft"
+    else:
+        css = "card card-danger"
+
+    budget_txt = "예산 이내" if row["예산 대비 차이"] <= 0 else "예산 초과"
+    budget_detail = (
+        f"{format_won(abs(row['예산 대비 차이']))} "
+        f"{'여유' if row['예산 대비 차이'] < 0 else '초과'}"
+        if budget > 0
+        else "예산 상한 미입력"
+    )
+
+    st.markdown(
+        f"""
+        <div class="{css}">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.4rem;">
+            <div style="font-weight:700;">{row['차량명']}</div>
+            <div class="pill pill-{grade}">{grade} 등급</div>
+          </div>
+          <div style="font-size:0.9rem; margin-bottom:0.3rem;">
+            {row['연식']}년식 · {row['차급']} · 차량가 {format_won(row['차량가'])}
+          </div>
+          <div style="font-size:0.9rem;">
+            • 월 차량 지출(할부+유류비+주차): <b>{format_won(row['월 할부+운행비'])}</b><br>
+            • 월 소득 대비: <b>{row['월 소득 대비 비율']*100:.1f}%</b><br>
+            • 3년 총비용(TCO): <b>{format_won(row['3년 TCO'])}</b><br>
+            • 정비 리스크: <b>{row['정비 리스크']}</b><br>
+            • 예산 기준: <b>{budget_txt}</b> ({budget_detail})
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ==============================
+# 7. AI 분석 요약
+# ==============================
+st.markdown('<div class="section-title">5) AI 재무 코치 한눈 요약</div>', unsafe_allow_html=True)
+
+if st.button("AI 재무 코치에게 설명 받기", type="primary"):
+    with st.spinner("AI가 내 재무 상황과 차량 조합을 분석하고 있습니다..."):
+        # LLM에 넘길 요약 데이터 준비
+        user_profile = {
+            "월_소득": income,
+            "월_고정지출": fixed_cost,
+            "자녀수": children,
+            "월_주행거리_km": monthly_km,
+            "월_차량_예산상한": budget,
+            "할부개월수": loan_months,
+            "가용소득": disposable_income,
+        }
+
+        cars_payload = []
+        for _, row in df.iterrows():
+            cars_payload.append(
+                {
+                    "차량명": row["차량명"],
+                    "연식": int(row["연식"]),
+                    "차급": row["차급"],
+                    "재무_안전도_등급": row["재무 안전도 등급"],
+                    "월_차량지출": int(row["월 할부+운행비"]),
+                    "월_소득_대비_비율": float(row["월 소득 대비 비율"]),
+                    "삼년_TCO": int(row["3년 TCO"]),
+                    "예산_대비_차이": int(row["예산 대비 차이"]),
+                    "정비_리스크": row["정비 리스크"],
+                }
+            )
+
+        system_msg = {
+            "role": "system",
+            "content": (
+                "너는 중고차 구매를 돕는 재무 코치이자 엔카 상담 보조 도구야. "
+                "사용자의 월 소득/지출, 자녀 수, 예산 상한을 고려해서 "
+                "각 차량 조합이 얼마나 안전한 선택인지 솔직하지만 균형 있게 설명해줘. "
+                "단, '절대 사지 마세요'처럼 단정 짓기보다는 "
+                "'이 정도면 장기적으로 부담이 될 수 있다' 수준의 톤으로 조언해."
+            ),
+        }
+
+        user_msg = {
+            "role": "user",
+            "content": (
+                "다음은 한 사용자의 재무/생활 상황과 엔카에서 고른 후보 차량 목록이야.\n\n"
+                f"[사용자 프로필]\n{user_profile}\n\n"
+                f"[후보 차량 목록]\n{cars_payload}\n\n"
+                "아래 형식으로 한국어로 설명해줘.\n"
+                "1) 사용자 상황 요약 (월 소득, 고정 지출, 가용 소득, 자녀 수, 예산 상한 중심)\n"
+                "2) 등급별 해석: A/B/C 등급이 각각 이 사용자에게 어떤 의미인지 (숫자+생활 맥락)\n"
+                "3) 추천 차량: 상대적으로 재무 부담이 적은 차량 1~2대와 그 이유\n"
+                "4) 주의해서 봐야 할 차량: C 등급 차량이 있다면 왜 부담일 수 있는지\n"
+                "5) 한 문장 조언: '이 사용자는 월 소득의 몇 %를 차량에 쓰는 것을 가드레일로 삼으면 좋다'처럼 한 줄로 정리\n"
+                "가능하면 불릿 포인트를 적절히 사용해서 가독성 좋게 써줘."
+            ),
+        }
+
+        try:
+            completion = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[system_msg, user_msg],
+                temperature=0.35,
+            )
+            ai_text = completion.choices[0].message.content
+            st.markdown(
+                f"""
+                <div class="card">
+                {ai_text}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        except Exception as e:
+            st.error(f"LLM 호출 중 오류가 발생했습니다: {e}")
+else:
+    st.info(
+        "왼쪽에 내 상황을 입력한 뒤, 위 버튼을 눌러 AI 재무 코치에게 "
+        "후보 차량 조합을 한눈에 설명받을 수 있습니다."
+    )
